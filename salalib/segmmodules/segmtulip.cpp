@@ -18,6 +18,8 @@
 
 #include "salalib/segmmodules/segmtulip.h"
 
+#include "salalib/parallelanalysis.h"
+
 #include "genlib/stringutils.h"
 
 bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
@@ -303,20 +305,6 @@ bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
     tulip_bins /= 2; // <- actually use semicircle of tulip bins
     tulip_bins += 1;
 
-    std::vector<std::vector<SegmentData>> bins(tulip_bins);
-
-    // TODO: Replace these with STL
-    AnalysisInfo ***audittrail;
-    unsigned int **uncovered;
-    audittrail = new AnalysisInfo **[map.getConnections().size()];
-    uncovered = new unsigned int *[map.getConnections().size()];
-    for (size_t i = 0; i < map.getConnections().size(); i++) {
-        audittrail[i] = new AnalysisInfo *[radius_unconverted.size()];
-        for (size_t j = 0; j < radius_unconverted.size(); j++) {
-            audittrail[i][j] = new AnalysisInfo[2];
-        }
-        uncovered[i] = new unsigned int[2];
-    }
     std::vector<double> radius;
     for (r = 0; r < radius_unconverted.size(); r++) {
         if (m_radius_type == Options::RADIUS_ANGULAR && radius_unconverted[r] != -1) {
@@ -341,28 +329,45 @@ bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
         radiusmask |= (1 << i);
     }
 
-    for (size_t cursor = 0; cursor < map.getConnections().size(); cursor++) {
-        AttributeRow &row =
-            map.getAttributeRowFromShapeIndex(cursor);
+    const size_t nconn = map.getConnections().size();
 
-        if (m_sel_only) {
-            // could use m_selection_set.searchindex(rowid) to find
-            // if this row is selected as m_selection_set is ordered for axial and segment maps, etc
-            // BUT, actually quicker to check the tag in the attributes that shows it's selected
-            if (!row.isSelected()) {
-                continue;
-            }
+    // Per-thread search data (formerly heap-allocated 3D arrays shared by every search).
+    struct TulipState {
+        int radiussize;
+        std::vector<AnalysisInfo> audit;
+        std::vector<unsigned int> uncovered;
+        std::vector<std::vector<SegmentData>> bins;
+        TulipState(size_t n, int rs, int tb) : radiussize(rs), audit(n * size_t(rs) * 2), uncovered(n * 2), bins(tb) {}
+        AnalysisInfo &at(size_t j, int k, int dir) { return audit[(j * size_t(radiussize) + size_t(k)) * 2 + size_t(dir)]; }
+        unsigned int &unc(size_t j, int dir) { return uncovered[j * 2 + size_t(dir)]; }
+    };
+
+    std::vector<AttributeRow *> rows(nconn);
+    std::vector<size_t> sources;
+    for (size_t cursor = 0; cursor < nconn; cursor++) {
+        rows[cursor] = &map.getAttributeRowFromShapeIndex(cursor);
+        // could use m_selection_set.searchindex(rowid) to find
+        // if this row is selected as m_selection_set is ordered for axial and segment maps, etc
+        // BUT, actually quicker to check the tag in the attributes that shows it's selected
+        if (!m_sel_only || rows[cursor]->isSelected()) {
+            sources.push_back(cursor);
         }
+    }
+
+    auto analyseSource = [&](size_t cursor, TulipState &state, depthmapX::PendingValues &out) {
+        auto &bins = state.bins;
+        const AttributeRow &row = *rows[cursor];
+        auto setValue = [&out](int col, float value) { out.emplace_back(col, value); };
 
         for (int k = 0; k < tulip_bins; k++) {
             bins[k].clear();
         }
-        for (size_t j = 0; j < map.getConnections().size(); j++) {
+        for (size_t j = 0; j < nconn; j++) {
             for (int dir = 0; dir < 2; dir++) {
                 for (int k = 0; k < radiussize; k++) {
-                    audittrail[j][k][dir].clearLine();
+                    state.at(j, k, dir).clearLine();
                 }
-                uncovered[j][dir] = radiusmask;
+                state.unc(j, dir) = radiusmask;
             }
         }
 
@@ -397,37 +402,37 @@ bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
 
             int ref = lineindex.ref;
             int dir = (lineindex.dir == 1) ? 0 : 1;
-            int coverage = lineindex.coverage & uncovered[ref][dir];
+            int coverage = lineindex.coverage & state.unc(ref, dir);
             if (coverage != 0) {
                 int rbin = 0;
                 int rbinbase;
                 if (lineindex.previous.ref != -1) {
-                    uncovered[ref][dir] &= ~coverage;
+                    state.unc(ref, dir) &= ~coverage;
                     while (((coverage >> rbin) & 0x1) == 0)
                         rbin++;
                     rbinbase = rbin;
                     while (rbin < radiussize) {
                         if (((coverage >> rbin) & 0x1) == 1) {
-                            audittrail[ref][rbin][dir].depth = depthlevel;
-                            audittrail[ref][rbin][dir].previous = lineindex.previous;
-                            audittrail[lineindex.previous.ref][rbin][(lineindex.previous.dir == 1) ? 0 : 1].leaf =
+                            state.at(ref, rbin, dir).depth = depthlevel;
+                            state.at(ref, rbin, dir).previous = lineindex.previous;
+                            state.at(lineindex.previous.ref, rbin, (lineindex.previous.dir == 1) ? 0 : 1).leaf =
                                 false;
                         }
                         rbin++;
                     }
                 } else {
                     rbinbase = 0;
-                    uncovered[ref][0] &= ~coverage;
-                    uncovered[ref][1] &= ~coverage;
+                    state.unc(ref, 0) &= ~coverage;
+                    state.unc(ref, 1) &= ~coverage;
                 }
-                Connector &line = map.getConnections()[ref];
+                const Connector &line = map.getConnections()[ref];
                 float seglength;
                 int extradepth;
                 if (lineindex.dir != -1) {
                     for (auto &segconn : line.m_forward_segconns) {
                         rbin = rbinbase;
                         SegmentRef conn = segconn.first;
-                        if ((uncovered[conn.ref][(conn.dir == 1 ? 0 : 1)] & coverage) != 0) {
+                        if ((state.unc(conn.ref, (conn.dir == 1 ? 0 : 1)) & coverage) != 0) {
                             // EF routeweight*
                             if (routeweight_col != -1) { // EF here we do the weighting of the angular cost by the
                                                          // weight of the next segment
@@ -475,7 +480,7 @@ bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
                     for (auto &segconn : line.m_back_segconns) {
                         rbin = rbinbase;
                         SegmentRef conn = segconn.first;
-                        if ((uncovered[conn.ref][(conn.dir == 1 ? 0 : 1)] & coverage) != 0) {
+                        if ((state.unc(conn.ref, (conn.dir == 1 ? 0 : 1)) & coverage) != 0) {
                             // EF routeweight*
                             if (routeweight_col != -1) { // EF here we do the weighting of the angular cost by the
                                                          // weight of the next segment
@@ -527,15 +532,15 @@ bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
             double curs_node_count = 0.0, curs_total_depth = 0.0;
             double curs_total_weight = 0.0, curs_total_weighted_depth = 0.0;
             size_t j;
-            for (j = 0; j < map.getConnections().size(); j++) {
+            for (j = 0; j < nconn; j++) {
                 // find dir according
-                bool m0 = ((uncovered[j][0] >> k) & 0x1) == 0;
-                bool m1 = ((uncovered[j][1] >> k) & 0x1) == 0;
+                bool m0 = ((state.unc(j, 0) >> k) & 0x1) == 0;
+                bool m1 = ((state.unc(j, 1) >> k) & 0x1) == 0;
                 if ((m0 | m1) != 0) {
                     int dir;
                     if (m0 & m1) {
                         // dir is the one with the lowest depth:
-                        if (audittrail[j][k][0].depth < audittrail[j][k][1].depth)
+                        if (state.at(j, k, 0).depth < state.at(j, k, 1).depth)
                             dir = 0;
                         else
                             dir = 1;
@@ -544,11 +549,11 @@ bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
                         dir = m0 ? 0 : 1;
                     }
                     curs_node_count++;
-                    curs_total_depth += audittrail[j][k][dir].depth;
+                    curs_total_depth += state.at(j, k, dir).depth;
                     curs_total_weight += weights[j];
-                    curs_total_weighted_depth += audittrail[j][k][dir].depth * weights[j];
+                    curs_total_weighted_depth += state.at(j, k, dir).depth * weights[j];
                     //
-                    if (m_choice && audittrail[j][k][dir].leaf) {
+                    if (m_choice && state.at(j, k, dir).leaf) {
                         // note, graph may be directed (e.g., for one way streets), so both ways must be included from
                         // now on:
                         SegmentRef here = SegmentRef(dir == 0 ? 1 : -1, j);
@@ -562,15 +567,15 @@ bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
                                 int heredir = (here.dir == 1) ? 0 : 1;
                                 // each node has the existing choicecount and choiceweight from previously encountered
                                 // nodes added to it
-                                audittrail[here.ref][k][heredir].choice += choicecount;
+                                state.at(here.ref, k, heredir).choice += choicecount;
                                 // nb, weighted values calculated anyway to save time on 'if'
-                                audittrail[here.ref][k][heredir].weighted_choice += choiceweight;
+                                state.at(here.ref, k, heredir).weighted_choice += choiceweight;
                                 // EFEF*
-                                audittrail[here.ref][k][heredir].weighted_choice2 += choiceweight2;
+                                state.at(here.ref, k, heredir).weighted_choice2 += choiceweight2;
                                 //*EFEF
                                 // if the node hasn't been encountered before, the choicecount and choiceweight is
                                 // incremented for all remaining nodes to be encountered on the backwards route from it
-                                if (!audittrail[here.ref][k][heredir].choicecovered) {
+                                if (!state.at(here.ref, k, heredir).choicecovered) {
                                     // this node has not been encountered before: this adds the choicecount and weight
                                     // for this node, and flags it as visited
                                     choicecount++;
@@ -579,28 +584,28 @@ bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
                                     choiceweight2 += weights2[here.ref] * rootweight; // rootweight!
                                     //*EFEF
 
-                                    audittrail[here.ref][k][heredir].choicecovered = true;
+                                    state.at(here.ref, k, heredir).choicecovered = true;
                                     // note, for weighted choice, the start and end points have choice added to them:
                                     if (m_weighted_measure_col != -1) {
-                                        audittrail[here.ref][k][heredir].weighted_choice +=
+                                        state.at(here.ref, k, heredir).weighted_choice +=
                                             (weights[here.ref] * rootweight) / 2.0;
                                         // EFEF*
                                         if (weighting_col2 != -1) {
-                                            audittrail[here.ref][k][heredir].weighted_choice2 +=
+                                            state.at(here.ref, k, heredir).weighted_choice2 +=
                                                 (weights2[here.ref] * rootweight) / 2.0; // rootweight!
                                         }
                                         //*EFEF
                                     }
                                 }
-                                here = audittrail[here.ref][k][heredir].previous;
+                                here = state.at(here.ref, k, heredir).previous;
                             }
                             // note, for weighted choice, the start and end points have choice added to them:
                             // (this is the summed weight for all starting nodes encountered in this path)
                             if (m_weighted_measure_col != -1) {
-                                audittrail[here.ref][k][(here.dir == 1) ? 0 : 1].weighted_choice += choiceweight / 2.0;
+                                state.at(here.ref, k, (here.dir == 1) ? 0 : 1).weighted_choice += choiceweight / 2.0;
                                 // EFEF*
                                 if (weighting_col2 != -1) {
-                                    audittrail[here.ref][k][(here.dir == 1) ? 0 : 1].weighted_choice2 +=
+                                    state.at(here.ref, k, (here.dir == 1) ? 0 : 1).weighted_choice2 +=
                                         choiceweight2 / 2.0;
                                 }
                                 //*EFEF
@@ -612,62 +617,88 @@ bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
             double total_depth_conv = curs_total_depth / ((tulip_bins - 1.0f) * 0.5f);
             double total_weighted_depth_conv = curs_total_weighted_depth / ((tulip_bins - 1.0f) * 0.5f);
             //
-            row.setValue(count_col[k], float(curs_node_count));
+            setValue(count_col[k], float(curs_node_count));
             if (curs_node_count > 1) {
                 // for dmap 8 and above, mean depth simply isn't calculated as for radius measures it is meaningless
-                row.setValue(td_col[k], total_depth_conv);
+                setValue(td_col[k], total_depth_conv);
                 if (m_weighted_measure_col != -1) {
-                    row.setValue(total_weight_col[k], float(curs_total_weight));
-                    row.setValue(w_td_col[k], float(total_weighted_depth_conv));
+                    setValue(total_weight_col[k], float(curs_total_weight));
+                    setValue(w_td_col[k], float(total_weighted_depth_conv));
                 }
             } else {
-                row.setValue(td_col[k], -1);
+                setValue(td_col[k], -1);
                 if (m_weighted_measure_col != -1) {
-                    row.setValue(total_weight_col[k], -1.0f);
-                    row.setValue(w_td_col[k], -1.0f);
+                    setValue(total_weight_col[k], -1.0f);
+                    setValue(w_td_col[k], -1.0f);
                 }
             }
             // for dmap 10 an above, integration is included!
             if (total_depth_conv > 1e-9) {
-                row.setValue(integ_col[k], (float)(curs_node_count * curs_node_count / total_depth_conv));
+                setValue(integ_col[k], (float)(curs_node_count * curs_node_count / total_depth_conv));
                 if (m_weighted_measure_col != -1) {
-                    row.setValue(w_integ_col[k],
+                    setValue(w_integ_col[k],
                                  (float)(curs_total_weight * curs_total_weight / total_weighted_depth_conv));
                 }
             } else {
-                row.setValue(integ_col[k], -1);
+                setValue(integ_col[k], -1);
                 if (m_weighted_measure_col != -1) {
-                    row.setValue(w_integ_col[k], -1.0f);
+                    setValue(w_integ_col[k], -1.0f);
                 }
             }
         }
-        //
-        processed_rows++;
-        //
-        if (comm) {
-            if (qtimer(atime, 500)) {
-                if (comm->IsCancelled()) {
-                    // interactive is usual Depthmap: throw an exception if cancelled
-                    if (interactive) {
-                        for (size_t i = 0; i < map.getConnections().size(); i++) {
-                            for (size_t j = 0; j < size_t(radiussize); j++) {
-                                delete[] audittrail[i][j];
-                            }
-                            delete[] audittrail[i];
-                            delete[] uncovered[i];
-                        }
-                        delete[] audittrail;
-                        delete[] uncovered;
-                        throw Communicator::CancelledException();
-                    } else {
-                        // in non-interactive mode, retain what's been processed already
-                        break;
-                    }
-                }
-                comm->CommPostMessage(Communicator::CURRENT_RECORD, cursor);
-            }
-        }
+    };
+
+    // Each source is an independent search. Choice values are accumulated per thread and summed
+    // at the end (integer choice counts are exact; weighted choice can differ from a sequential
+    // run only in the last bits of floating point rounding).
+    const unsigned int nthreads = depthmapX::threadsFor(sources.size());
+    std::vector<TulipState> states;
+    states.reserve(nthreads);
+    for (unsigned int t = 0; t < nthreads; t++) {
+        states.emplace_back(nconn, radiussize, tulip_bins);
     }
+    std::vector<depthmapX::PendingValues> results(sources.size());
+    std::vector<char> finished(sources.size(), 0);
+
+    bool completed = depthmapX::parallelFor(
+        sources.size(), nthreads,
+        [&](size_t index, unsigned int thread) {
+            analyseSource(sources[index], states[thread], results[index]);
+            finished[index] = 1;
+        },
+        [comm](size_t done) {
+            if (comm) {
+                if (comm->IsCancelled()) {
+                    return false;
+                }
+                comm->CommPostMessage(Communicator::CURRENT_RECORD, static_cast<int>(done));
+            }
+            return true;
+        });
+    if (!completed && interactive) {
+        // interactive is usual Depthmap: throw an exception if cancelled
+        throw Communicator::CancelledException();
+    }
+    // in non-interactive mode, retain what's been processed already
+    for (size_t index = 0; index < sources.size(); index++) {
+        if (!finished[index]) {
+            continue;
+        }
+        for (const auto &value : results[index]) {
+            rows[sources[index]]->setValue(value.first, value.second);
+        }
+        processed_rows++;
+    }
+
+    // merge the per-thread choice totals
+    auto choiceTotal = [&](size_t cursor, size_t r, int dir, double AnalysisInfo::*field) {
+        double total = 0.0;
+        for (auto &state : states) {
+            total += state.at(cursor, int(r), dir).*field;
+        }
+        return total;
+    };
+
     if (m_choice) {
         for (size_t cursor = 0; cursor < map.getConnections().size(); cursor++) {
             AttributeRow &row =
@@ -675,12 +706,13 @@ bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
             for (size_t r = 0; r < radius.size(); r++) {
                 // according to Eva's correction, total choice and total weighted choice
                 // should already have been accumulated by radius at this stage
-                double total_choice = audittrail[cursor][r][0].choice + audittrail[cursor][r][1].choice;
-                double total_weighted_choice =
-                    audittrail[cursor][r][0].weighted_choice + audittrail[cursor][r][1].weighted_choice;
+                double total_choice =
+                    choiceTotal(cursor, r, 0, &AnalysisInfo::choice) + choiceTotal(cursor, r, 1, &AnalysisInfo::choice);
+                double total_weighted_choice = choiceTotal(cursor, r, 0, &AnalysisInfo::weighted_choice) +
+                                               choiceTotal(cursor, r, 1, &AnalysisInfo::weighted_choice);
                 // EFEF*
-                double total_weighted_choice2 =
-                    audittrail[cursor][r][0].weighted_choice2 + audittrail[cursor][r][1].weighted_choice2;
+                double total_weighted_choice2 = choiceTotal(cursor, r, 0, &AnalysisInfo::weighted_choice2) +
+                                                choiceTotal(cursor, r, 1, &AnalysisInfo::weighted_choice2);
                 //*EFEF
 
                 // normalised choice now excluded for two reasons:
@@ -704,16 +736,6 @@ bool SegmentTulip::run(Communicator *comm, ShapeGraph &map, bool) {
             }
         }
     }
-    for (size_t i = 0; i < map.getConnections().size(); i++) {
-        for (int j = 0; j < radiussize; j++) {
-            delete[] audittrail[i][j];
-        }
-        delete[] audittrail[i];
-        delete[] uncovered[i];
-    }
-    delete[] audittrail;
-    delete[] uncovered;
-
     map.setDisplayedAttribute(-2); // <- override if it's already showing
     if (m_choice) {
         map.setDisplayedAttribute(choice_col.back());

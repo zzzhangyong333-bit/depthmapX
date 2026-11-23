@@ -18,12 +18,16 @@
 
 #include "salalib/vgamodules/vgametric.h"
 
+#include "salalib/parallelanalysis.h"
+#include "salalib/vgamodules/vgasearchstate.h"
+
 #include "genlib/stringutils.h"
 
 #include <algorithm>
 
 // This is a slow algorithm, but should give the correct answer
-// for demonstrative purposes
+// for demonstrative purposes. Each source point is searched independently, so the
+// searches are spread over all CPU cores.
 
 bool VGAMetric::run(Communicator *comm, PointMap &map, bool) {
     time_t atime = 0;
@@ -56,85 +60,100 @@ bool VGAMetric::run(Communicator *comm, PointMap &map, bool) {
     std::string count_col_text = std::string("Metric Node Count") + radius_text;
     int count_col = attributes.insertOrResetColumn(count_col_text.c_str());
 
-    int count = 0;
-
+    std::vector<PixelRef> sources;
+    size_t skipped = 0;
     for (size_t i = 0; i < map.getCols(); i++) {
         for (size_t j = 0; j < map.getRows(); j++) {
             PixelRef curs = PixelRef(static_cast<short>(i), static_cast<short>(j));
-
             if (map.getPoint(curs).filled()) {
-
                 if (m_gates_only) {
-                    count++;
+                    skipped++;
                     continue;
                 }
-
-                // TODO: Break out miscs/dist/cumangle into local variables and remove from Point class
-                for (auto &point : map.getPoints()) {
-                    point.m_misc = 0;
-                    point.m_dist = -1.0f;
-                    point.m_cumangle = 0.0f;
-                }
-
-                float euclid_depth = 0.0f;
-                float total_depth = 0.0f;
-                float total_angle = 0.0f;
-                int total_nodes = 0;
-
-                // note that m_misc is used in a different manner to analyseGraph / PointDepth
-                // here it marks the node as used in calculation only
-
-                std::set<MetricTriple> search_list;
-                search_list.insert(MetricTriple(0.0f, curs, NoPixel));
-                while (search_list.size()) {
-                    std::set<MetricTriple>::iterator it = search_list.begin();
-                    MetricTriple here = *it;
-                    search_list.erase(it);
-                    if (m_radius != -1.0 && (here.dist * map.getSpacing()) > m_radius) {
-                        break;
-                    }
-                    Point &p = map.getPoint(here.pixel);
-                    // nb, the filled check is necessary as diagonals seem to be stored with 'gaps' left in
-                    if (p.filled() && p.m_misc != ~0) {
-                        p.getNode().extractMetric(search_list, &map, here);
-                        p.m_misc = ~0;
-                        if (!p.getMergePixel().empty()) {
-                            Point &p2 = map.getPoint(p.getMergePixel());
-                            if (p2.m_misc != ~0) {
-                                p2.m_cumangle = p.m_cumangle;
-                                p2.getNode().extractMetric(search_list, &map,
-                                                           MetricTriple(here.dist, p.getMergePixel(), NoPixel));
-                                p2.m_misc = ~0;
-                            }
-                        }
-                        total_depth += float(here.dist * map.getSpacing());
-                        total_angle += p.m_cumangle;
-                        euclid_depth += float(map.getSpacing() * dist(here.pixel, curs));
-                        total_nodes += 1;
-                    }
-                }
-
-                AttributeRow &row = attributes.getRow(AttributeKey(curs));
-                row.setValue(mspa_col, float(double(total_angle) / double(total_nodes)));
-                row.setValue(mspl_col, float(double(total_depth) / double(total_nodes)));
-                row.setValue(dist_col, float(double(euclid_depth) / double(total_nodes)));
-                // This is the legacy Mean Penn Distance formula. The root contributes zero to both
-                // totals and is included in total_nodes for compatibility with historic output.
-                row.setValue(penn_col, float(std::max(0.0, double(total_depth - euclid_depth)) /
-                                             double(total_nodes)));
-                row.setValue(count_col, float(total_nodes));
-
-                count++; // <- increment count
-            }
-            if (comm) {
-                if (qtimer(atime, 500)) {
-                    if (comm->IsCancelled()) {
-                        throw Communicator::CancelledException();
-                    }
-                    comm->CommPostMessage(Communicator::CURRENT_RECORD, count);
-                }
+                sources.push_back(curs);
             }
         }
+    }
+
+    const unsigned int nthreads = depthmapX::threadsFor(sources.size());
+    std::vector<depthmapX::VGASearchState> states;
+    states.reserve(nthreads);
+    for (unsigned int t = 0; t < nthreads; t++) {
+        states.emplace_back(map.getRows(), map.getCols(), 0, -1.0f, 0.0f);
+    }
+    std::vector<depthmapX::PendingValues> results(sources.size());
+
+    auto analyseSource = [&](PixelRef curs, depthmapX::VGASearchState &state, depthmapX::PendingValues &out) {
+        state.reset();
+
+        float euclid_depth = 0.0f;
+        float total_depth = 0.0f;
+        float total_angle = 0.0f;
+        int total_nodes = 0;
+
+        // note that misc is used in a different manner to analyseGraph / PointDepth
+        // here it marks the node as used in calculation only
+
+        depthmapX::SearchQueue<MetricTriple> search_list;
+        search_list.insert(MetricTriple(0.0f, curs, NoPixel));
+        MetricTriple here;
+        while (search_list.pop(here)) {
+            if (m_radius != -1.0 && (here.dist * map.getSpacing()) > m_radius) {
+                break;
+            }
+            Point &p = map.getPoint(here.pixel);
+            size_t pidx = state.index(here.pixel);
+            // nb, the filled check is necessary as diagonals seem to be stored with 'gaps' left in
+            if (p.filled() && state.misc[pidx] != ~0) {
+                depthmapX::extractMetric(p.getNode(), search_list, map, state, here);
+                state.touched.push_back(pidx);
+                state.misc[pidx] = ~0;
+                if (!p.getMergePixel().empty()) {
+                    Point &p2 = map.getPoint(p.getMergePixel());
+                    size_t p2idx = state.index(p.getMergePixel());
+                    if (state.misc[p2idx] != ~0) {
+                        state.touched.push_back(p2idx);
+                        state.cumangle[p2idx] = state.cumangle[pidx];
+                        depthmapX::extractMetric(p2.getNode(), search_list, map, state,
+                                                 MetricTriple(here.dist, p.getMergePixel(), NoPixel));
+                        state.misc[p2idx] = ~0;
+                    }
+                }
+                total_depth += float(here.dist * map.getSpacing());
+                total_angle += state.cumangle[pidx];
+                euclid_depth += float(map.getSpacing() * dist(here.pixel, curs));
+                total_nodes += 1;
+            }
+        }
+
+        out.emplace_back(mspa_col, float(double(total_angle) / double(total_nodes)));
+        out.emplace_back(mspl_col, float(double(total_depth) / double(total_nodes)));
+        out.emplace_back(dist_col, float(double(euclid_depth) / double(total_nodes)));
+        // This is the legacy Mean Penn Distance formula. The root contributes zero to both
+        // totals and is included in total_nodes for compatibility with historic output.
+        out.emplace_back(penn_col,
+                         float(std::max(0.0, double(total_depth - euclid_depth)) / double(total_nodes)));
+        out.emplace_back(count_col, float(total_nodes));
+    };
+
+    depthmapX::runAnalysisInParallel(
+        comm, sources.size(), nthreads,
+        [&](size_t index, unsigned int thread) { analyseSource(sources[index], states[thread], results[index]); },
+        skipped);
+
+    for (size_t index = 0; index < sources.size(); index++) {
+        AttributeRow &row = attributes.getRow(AttributeKey(sources[index]));
+        for (const auto &value : results[index]) {
+            row.setValue(value.first, value.second);
+        }
+    }
+
+    // leave the point map's search fields as the last analysed point left them (legacy behaviour)
+    if (!sources.empty()) {
+        depthmapX::VGASearchState finalState(map.getRows(), map.getCols(), 0, -1.0f, 0.0f);
+        depthmapX::PendingValues ignored;
+        analyseSource(sources.back(), finalState, ignored);
+        finalState.writeTo(map);
     }
 
     map.overrideDisplayedAttribute(-2);

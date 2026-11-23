@@ -18,4 +18,5 @@ target_sources(salalib
        vgavisualglobaldepth.h
        vgaisovist.h
        vgathroughvision.h
-       vgavisuallocal.h)
+       vgavisuallocal.h
+       vgasearchstate.h)

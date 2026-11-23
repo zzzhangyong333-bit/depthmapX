@@ -48,6 +48,8 @@ CColourScaleDlg::CColourScaleDlg(QWidget *parent) : QDialog(parent) {
     c_color_type->addItem(QString(tr("Equal Ranges (Greyscale)")));           // GREYSCALE
     c_color_type->addItem(QString(tr("Equal Ranges (Monochrome)")));          // MONOCHROME
     c_color_type->addItem(QString(tr("Equal Ranges (3-Colour Hue Only)")));   // HUEONLYAXMANESQUE
+    c_color_type->addItem(QString(tr("Continuous (Viridis)")));               // VIRIDIS
+    c_color_type->addItem(QString(tr("Continuous (Magma)")));                 // MAGMA
 
     m_color_type_map.push_back(DisplayParams::AXMANESQUE);
     m_color_type_map.push_back(DisplayParams::BLUERED);
@@ -56,6 +58,8 @@ CColourScaleDlg::CColourScaleDlg(QWidget *parent) : QDialog(parent) {
     m_color_type_map.push_back(DisplayParams::GREYSCALE);
     m_color_type_map.push_back(DisplayParams::MONOCHROME);
     m_color_type_map.push_back(DisplayParams::HUEONLYAXMANESQUE);
+    m_color_type_map.push_back(DisplayParams::VIRIDIS);
+    m_color_type_map.push_back(DisplayParams::MAGMA);
 
     Clear();
 

@@ -6,7 +6,8 @@ set(genlibTest_SRCS
     testbspnode.cpp
     teststringutils.cpp
     testpafmath.cpp
-    testcontainerutils.cpp)
+    testcontainerutils.cpp
+    testparallel.cpp)
 
 set(LINK_LIBS
     genlib)
@@ -14,5 +15,6 @@ set(LINK_LIBS
 include_directories("../ThirdParty/Catch")
 
 add_executable(${genlibtest} ${genlibTest_SRCS})
-target_link_libraries(${genlibtest} ${LINK_LIBS})
+find_package(Threads REQUIRED)
+target_link_libraries(${genlibtest} ${LINK_LIBS} Threads::Threads)
     

@@ -79,6 +79,8 @@ struct PafColor
    PafColor& makeHueOnlyAxmanesque( double field);
    PafColor& makePurpleOrange( double field );
    PafColor& makeBlueRed( double field );
+   PafColor& makeViridis( double field );
+   PafColor& makeMagma( double field );
    PafColor& makeGreyScale( double field );
    PafColor& makeMonochrome( double field );
    PafColor& makeDepthmapClassic( double field, double blue, double red );

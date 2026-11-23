@@ -25,7 +25,7 @@
 #include <QMessageBox>
 
 bool SegmentPathsMainWindow::createMenus(MainWindow *mainWindow) {
-    QMenu *toolsMenu = MainWindowHelpers::getOrAddRootMenu(mainWindow, tr("&Tools"));
+    QMenu *toolsMenu = MainWindowHelpers::getOrAddRootMenu(mainWindow, tr("A&nalysis"));
     QMenu *segmentMenu = MainWindowHelpers::getOrAddMenu(toolsMenu, tr("&Segment"));
     QMenu *shortestPathsMenu = MainWindowHelpers::getOrAddMenu(segmentMenu, tr("Shortest Paths"));
 

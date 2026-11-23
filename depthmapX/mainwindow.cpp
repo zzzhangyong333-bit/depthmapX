@@ -16,6 +16,7 @@
 
 
 #include "mainwindow.h"
+#include "depthmapX/apptheme.h"
 
 #include "depthmapX/views/depthmapview/depthmapview.h"
 #include "depthmapX/views/3dview/3dview.h"
@@ -29,6 +30,7 @@
 #include <QtWidgets/QMdiArea>
 #include <QtWidgets/QDockWidget>
 #include <QtWidgets/QToolButton>
+#include <QtWidgets/QActionGroup>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QStatusBar>
 #include <QtWidgets/QMenu>
@@ -81,12 +83,12 @@ MainWindow::MainWindow(const QString &fileToLoad, Settings &settings) : mSetting
 
 
     m_indexWidget = new IndexWidget(this);
-    QDockWidget *indexDock = new QDockWidget(tr("Index"), this);
+    QDockWidget *indexDock = new QDockWidget(tr("Map Layers"), this);
     indexDock->setObjectName(QLatin1String("IndexWindow"));
     indexDock->setWidget(m_indexWidget);
     addDockWidget(Qt::LeftDockWidgetArea, indexDock);
 
-    QDockWidget *AttributesListDock = new QDockWidget(tr("AttributesList"), this);
+    QDockWidget *AttributesListDock = new QDockWidget(tr("Attributes"), this);
     AttributesListDock->setObjectName(QLatin1String("AttributesListWindow"));
     AttributesListDock->setWidget(setupAttributesListWidget());
     addDockWidget(Qt::LeftDockWidgetArea, AttributesListDock);
@@ -3557,6 +3559,29 @@ void MainWindow::createMenus()
     //editMenu->addAction(zoomToSelectionAct);
     editMenu->addAction(selectionToLayerAct);
 
+    viewMenu = menuBar()->addMenu(tr("&View"));
+    viewMenu->addAction(RecentAct);
+    viewMenu->addAction(showGridAct);
+    viewMenu->addAction(attributeSummaryAct);
+    viewMenu->addSeparator();
+    themeMenu = viewMenu->addMenu(tr("&Theme"));
+    {
+        QActionGroup *themeGroup = new QActionGroup(this);
+        themeGroup->setExclusive(true);
+        const QString currentTheme = mSettings.readSetting(AppTheme::settingTag, AppTheme::light).toString();
+        for (const QString &theme : AppTheme::availableThemes()) {
+            QAction *themeAct = themeMenu->addAction(AppTheme::displayName(theme));
+            themeAct->setCheckable(true);
+            themeAct->setChecked(theme == currentTheme);
+            themeGroup->addAction(themeAct);
+            connect(themeAct, &QAction::triggered, this, [this, theme]() {
+                AppTheme::apply(theme);
+                mSettings.writeSetting(AppTheme::settingTag, theme);
+            });
+        }
+    }
+    viewMenu->addAction(optionsAct);
+
     mapMenu = menuBar()->addMenu(tr("&Map"));
     mapMenu->addAction(mapNewAct);
     mapMenu->addAction(deleteAct);
@@ -3575,18 +3600,9 @@ void MainWindow::createMenus()
     exportSubMenu->addAction(exportSegmentConnectionsPairAct);
     exportSubMenu->addAction(exportPointmapConnectionsPairAct);
 
-    attributesMenu = menuBar()->addMenu(tr("&Attributes"));
-    attributesMenu->addAction(addColumAct);
-    attributesMenu->addSeparator();
-    attributesMenu->addAction(renameColumnAct);
-    attributesMenu->addAction(updateColumAct);
-    attributesMenu->addAction(removeColumAct);
-    attributesMenu->addAction(columnPropertiesAct);
-    attributesMenu->addSeparator();
-    attributesMenu->addAction(pushValueAct);
-
-    toolsMenu = menuBar()->addMenu(tr("&Tools"));
-    visibilitySubMenu = toolsMenu->addMenu(tr("&Visibility"));
+    // All analyses live in one menu (formerly "Tools"), grouped by the kind of map they work on.
+    toolsMenu = menuBar()->addMenu(tr("A&nalysis"));
+    visibilitySubMenu = toolsMenu->addMenu(tr("&Visibility (VGA)"));
     visibilitySubMenu->addAction(SetGridAct);
     visibilitySubMenu->addAction(makeVisibilityGraphAct);
     visibilitySubMenu->addAction(unmakeVisibilityGraphAct);
@@ -3601,9 +3617,6 @@ void MainWindow::createMenus()
     stepDepthSubMenu->addAction(angularStepAct);
     visibilitySubMenu->addSeparator();
     visibilitySubMenu->addAction(convertDataMapLinesAct);
-    agentToolsSubMenu = toolsMenu->addMenu(tr("&Agent Tools"));
-    agentToolsSubMenu->addAction(runAgentAnalysisAct);
-    agentToolsSubMenu->addAction(loadAgentProgramAct);
 
     axialSubMenu = toolsMenu->addMenu(tr("A&xial / Convex / Pesh"));
     axialSubMenu->addAction(runGraphAnaysisAct);
@@ -3623,12 +3636,19 @@ void MainWindow::createMenus()
     segmentStepDepthSubMenu->addAction(segmentMetricStepAct);
 
     toolsMenu->addSeparator();
-    toolsMenu->addAction(optionsAct);
+    agentToolsSubMenu = toolsMenu->addMenu(tr("&Agent Tools"));
+    agentToolsSubMenu->addAction(runAgentAnalysisAct);
+    agentToolsSubMenu->addAction(loadAgentProgramAct);
 
-    viewMenu = menuBar()->addMenu(tr("&View"));
-    viewMenu->addAction(RecentAct);
-    viewMenu->addAction(showGridAct);
-    viewMenu->addAction(attributeSummaryAct);
+    attributesMenu = menuBar()->addMenu(tr("&Attributes"));
+    attributesMenu->addAction(addColumAct);
+    attributesMenu->addSeparator();
+    attributesMenu->addAction(renameColumnAct);
+    attributesMenu->addAction(updateColumAct);
+    attributesMenu->addAction(removeColumAct);
+    attributesMenu->addAction(columnPropertiesAct);
+    attributesMenu->addSeparator();
+    attributesMenu->addAction(pushValueAct);
 
     windowMenu = menuBar()->addMenu(tr("&Window"));
     windowMenu->addAction(mapAct);
@@ -3705,6 +3725,34 @@ void MainWindow::createToolBars()
     editToolBar->addWidget(JoinToolButton);
     editToolBar->setIconSize(QSize(16,16));
     editToolBar->setMovable(0);
+
+    // Quick access to the analyses: each button opens the same menu as Analysis > ...
+    // (so enabled/disabled states are always up to date).
+    analysisToolBar = addToolBar(tr("Analysis"));
+    analysisToolBar->setObjectName(QLatin1String("AnalysisToolBar"));
+    analysisToolBar->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    analysisToolBar->setMovable(0);
+    {
+        struct QuickMenu {
+            QString label;
+            QString tip;
+            QMenu *menu;
+        };
+        const QuickMenu quickMenus[] = {
+            {tr("Visibility (VGA)"), tr("Grid, visibility graph and VGA analyses"), visibilitySubMenu},
+            {tr("Axial"), tr("Axial map, convex and pesh analyses"), axialSubMenu},
+            {tr("Segment"), tr("Angular, topological and metric segment analyses"), segmentSubMenu},
+            {tr("Agents"), tr("Agent-based analysis"), agentToolsSubMenu},
+        };
+        for (const auto &quick : quickMenus) {
+            QToolButton *button = new QToolButton(this);
+            button->setText(quick.label);
+            button->setToolTip(quick.tip);
+            button->setMenu(quick.menu);
+            button->setPopupMode(QToolButton::InstantPopup);
+            analysisToolBar->addWidget(button);
+        }
+    }
 
     x_coord = new QComboBox(this);
     x_coord->setMinimumContentsLength(20);
