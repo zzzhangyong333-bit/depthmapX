@@ -302,11 +302,13 @@ private:
     QMenu *viewMenu;
     QMenu *windowMenu;
     QMenu *helpMenu;
+    QMenu *themeMenu;
 
     QToolBar *fileToolBar;
     QToolBar *editToolBar;
     QToolBar *plotToolBar;
     QToolBar *thirdViewToolBar;
+    QToolBar *analysisToolBar;
     QToolButton *fillColorToolButton;
     QToolButton *zoomToolButton;
     QToolButton *lineToolButton;

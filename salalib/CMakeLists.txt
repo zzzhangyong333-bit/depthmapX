@@ -34,6 +34,10 @@ add_compile_definitions(_DEPTHMAP SALALIB_LIBRARY)
 
 add_library(${salalib} STATIC ${salalib_SRCS} ${vgamodules_SRCS} ${axialmodules_SRCS} ${segmmodules_SRCS} ${parsers_SRCS})
 
+# the analysis modules run their per-node searches on several threads (see genlib/parallel.h)
+find_package(Threads REQUIRED)
+target_link_libraries(${salalib} PUBLIC Threads::Threads)
+
 add_subdirectory(vgamodules)
 add_subdirectory(axialmodules)
 add_subdirectory(segmmodules)

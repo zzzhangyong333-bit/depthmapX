@@ -18,8 +18,12 @@
 
 #include "salalib/axialmodules/axialintegration.h"
 
+#include "salalib/parallelanalysis.h"
+
 #include "genlib/pflipper.h"
 #include "genlib/stringutils.h"
+
+#include <algorithm>
 
 bool AxialIntegration::run(Communicator *comm, ShapeGraph &map, bool simple_version) {
     // note, from 10.0, Depthmap no longer includes *self* connections on axial lines
@@ -218,7 +222,7 @@ bool AxialIntegration::run(Communicator *comm, ShapeGraph &map, bool simple_vers
     }
 
     // for choice
-    AnalysisInfo **audittrail;
+    AnalysisInfo **audittrail = nullptr;
     if (m_choice) {
         audittrail = new AnalysisInfo *[map.getShapeCount()];
         for (size_t i = 0; i < map.getShapeCount(); i++) {
@@ -230,15 +234,18 @@ bool AxialIntegration::run(Communicator *comm, ShapeGraph &map, bool simple_vers
     // has already failed due to this!  when intro hand drawn fewest line (where user may have deleted)
     // it's going to get worse...
 
-    bool *covered = new bool[map.getShapeCount()];
+    // Per-thread scratch data for one search from a root line.
+    struct SearchState {
+        std::vector<char> covered;
+        std::vector<unsigned int> seen;
+        unsigned int stamp = 0;
+        explicit SearchState(size_t n) : covered(n, 0), seen(n, 0) {}
+    };
 
-    size_t i = -1;
-    for (auto & iter : attributes) {
-        i++;
-        AttributeRow &row = iter.getRow();
-        for (size_t j = 0; j < map.getShapeCount(); j++) {
-            covered[j] = false;
-        }
+    auto analyseRoot = [&](size_t i, SearchState &state, depthmapX::PendingValues &out) {
+        std::vector<char> &covered = state.covered;
+        auto setValue = [&out](int col, float value) { out.emplace_back(col, value); };
+        std::fill(covered.begin(), covered.end(), 0);
         if (m_choice) {
             for (size_t k = 0; k < map.getShapeCount(); k++) {
                 audittrail[k][0].previous.ref = -1; // note, 0th member used as radius doesn't matter
@@ -249,16 +256,24 @@ bool AxialIntegration::run(Communicator *comm, ShapeGraph &map, bool simple_vers
         if (m_local) {
             double control = 0.0;
             const std::vector<int> &connections = map.getConnections()[i].m_connections;
-            std::vector<int> totalneighbourhood;
+            // set membership via a per-thread stamp array instead of linear searches
+            state.stamp++;
+            size_t totalneighbourhood = 0;
+            auto addToTotal = [&](int ref) {
+                if (state.seen[size_t(ref)] != state.stamp) {
+                    state.seen[size_t(ref)] = state.stamp;
+                    totalneighbourhood++;
+                }
+            };
             for (int connection : connections) {
                 // n.b., as of Depthmap 10.0, connections[j] and i cannot coexist
                 // if (connections[j] != i) {
-                depthmapX::addIfNotExists(totalneighbourhood, connection);
+                addToTotal(connection);
                 int retro_size = 0;
                 auto &retconnectors = map.getConnections()[size_t(connection)].m_connections;
                 for (auto retconnector : retconnectors) {
                     retro_size++;
-                    depthmapX::addIfNotExists(totalneighbourhood, retconnector);
+                    addToTotal(retconnector);
                 }
                 control += 1.0 / double(retro_size);
                 //}
@@ -266,12 +281,12 @@ bool AxialIntegration::run(Communicator *comm, ShapeGraph &map, bool simple_vers
 
             if (!simple_version) {
                 if (connections.size() > 0) {
-                    row.setValue(control_col, float(control));
-                    row.setValue(controllability_col,
-                                 float(double(connections.size()) / double(totalneighbourhood.size() - 1)));
+                    setValue(control_col, float(control));
+                    setValue(controllability_col,
+                                 float(double(connections.size()) / double(totalneighbourhood - 1)));
                 } else {
-                    row.setValue(control_col, -1);
-                    row.setValue(controllability_col, -1);
+                    setValue(control_col, -1);
+                    setValue(controllability_col, -1);
                 }
             }
         }
@@ -303,7 +318,7 @@ bool AxialIntegration::run(Communicator *comm, ShapeGraph &map, bool simple_vers
                     audittrail[index][0].previous.ref =
                         previous; // note 0th member used here: can be used individually different radius previous
                 }
-                Connector &line = map.getConnections()[index];
+                const Connector &line = map.getConnections()[index];
                 for (size_t k = 0; k < line.m_connections.size(); k++) {
                     if (!covered[line.m_connections[k]]) {
                         covered[line.m_connections[k]] = true;
@@ -351,18 +366,18 @@ bool AxialIntegration::run(Communicator *comm, ShapeGraph &map, bool simple_vers
                 }
             }
             // set the attributes for this node:
-            row.setValue(count_col[r], float(node_count));
+            setValue(count_col[r], float(node_count));
             if (m_weighted_measure_col != -1) {
-                row.setValue(total_weight_col[r], float(total_weight));
+                setValue(total_weight_col[r], float(total_weight));
             }
             // node count > 1 to avoid divide by zero (was > 2)
             if (node_count > 1) {
                 // note -- node_count includes this one -- mean depth as per p.108 Social Logic of Space
                 double mean_depth = double(total_depth) / double(node_count - 1);
-                row.setValue(depth_col[r], float(mean_depth));
+                setValue(depth_col[r], float(mean_depth));
                 if (m_weighted_measure_col != -1) {
                     // weighted mean depth:
-                    row.setValue(w_depth_col[r], float(w_total_depth / total_weight));
+                    setValue(w_depth_col[r], float(w_total_depth / total_weight));
                 }
                 // total nodes > 2 to avoid divide by 0 (was > 3)
                 if (node_count > 2 && mean_depth > 1.0) {
@@ -371,52 +386,52 @@ bool AxialIntegration::run(Communicator *comm, ShapeGraph &map, bool simple_vers
                     double rra_d = ra / dvalue(node_count);
                     double rra_p = ra / pvalue(node_count);
                     double integ_tk = teklinteg(node_count, total_depth);
-                    row.setValue(integ_dv_col[r], float(1.0 / rra_d));
+                    setValue(integ_dv_col[r], float(1.0 / rra_d));
 
                     if (!simple_version) {
-                        row.setValue(integ_pv_col[r], float(1.0 / rra_p));
+                        setValue(integ_pv_col[r], float(1.0 / rra_p));
                         if (total_depth - node_count + 1 > 1) {
-                            row.setValue(integ_tk_col[r], float(integ_tk));
+                            setValue(integ_tk_col[r], float(integ_tk));
                         } else {
-                            row.setValue(integ_tk_col[r], -1.0f);
+                            setValue(integ_tk_col[r], -1.0f);
                         }
                     }
 
                     if (m_fulloutput) {
-                        row.setValue(ra_col[r], float(ra));
+                        setValue(ra_col[r], float(ra));
 
                         if (!simple_version) {
-                            row.setValue(rra_col[r], float(rra_d));
+                            setValue(rra_col[r], float(rra_d));
                         }
-                        row.setValue(td_col[r], float(total_depth));
+                        setValue(td_col[r], float(total_depth));
 
                         if (!simple_version) {
                             // alan's palm-tree normalisation: palmtree
                             double dmin = node_count - 1;
                             double dmax = palmtree(node_count, max_depth);
                             if (dmax != dmin) {
-                                row.setValue(penn_norm_col[r], float((dmax - total_depth) / (dmax - dmin)));
+                                setValue(penn_norm_col[r], float((dmax - total_depth) / (dmax - dmin)));
                             }
                         }
                     }
                 } else {
-                    row.setValue(integ_dv_col[r], -1.0f);
+                    setValue(integ_dv_col[r], -1.0f);
 
                     if (!simple_version) {
-                        row.setValue(integ_pv_col[r], -1.0f);
-                        row.setValue(integ_tk_col[r], -1.0f);
+                        setValue(integ_pv_col[r], -1.0f);
+                        setValue(integ_tk_col[r], -1.0f);
                     }
                     if (m_fulloutput) {
-                        row.setValue(ra_col[r], -1.0f);
+                        setValue(ra_col[r], -1.0f);
 
                         if (!simple_version) {
-                            row.setValue(rra_col[r], -1.0f);
+                            setValue(rra_col[r], -1.0f);
                         }
 
-                        row.setValue(td_col[r], -1.0f);
+                        setValue(td_col[r], -1.0f);
 
                         if (!simple_version) {
-                            row.setValue(penn_norm_col[r], -1.0f);
+                            setValue(penn_norm_col[r], -1.0f);
                         }
                     }
                 }
@@ -443,37 +458,75 @@ bool AxialIntegration::run(Communicator *comm, ShapeGraph &map, bool simple_vers
                     } else {
                         intensity = -1;
                     }
-                    row.setValue(entropy_col[r], float(entropy));
-                    row.setValue(rel_entropy_col[r], float(rel_entropy));
-                    row.setValue(intensity_col[r], float(intensity));
-                    row.setValue(harmonic_col[r], float(harmonic));
+                    setValue(entropy_col[r], float(entropy));
+                    setValue(rel_entropy_col[r], float(rel_entropy));
+                    setValue(intensity_col[r], float(intensity));
+                    setValue(harmonic_col[r], float(harmonic));
                 }
             } else {
-                row.setValue(depth_col[r], -1.0f);
-                row.setValue(integ_dv_col[r], -1.0f);
+                setValue(depth_col[r], -1.0f);
+                setValue(integ_dv_col[r], -1.0f);
 
                 if (!simple_version) {
-                    row.setValue(integ_pv_col[r], -1.0f);
-                    row.setValue(integ_tk_col[r], -1.0f);
-                    row.setValue(entropy_col[r], -1.0f);
-                    row.setValue(rel_entropy_col[r], -1.0f);
-                    row.setValue(harmonic_col[r], -1.0f);
+                    setValue(integ_pv_col[r], -1.0f);
+                    setValue(integ_tk_col[r], -1.0f);
+                    setValue(entropy_col[r], -1.0f);
+                    setValue(rel_entropy_col[r], -1.0f);
+                    setValue(harmonic_col[r], -1.0f);
                 }
             }
             ++r;
         }
-        //
-        if (comm) {
-            if (qtimer(atime, 500)) {
-                if (comm->IsCancelled()) {
-                    delete[] covered;
-                    throw Communicator::CancelledException();
+    };
+
+    std::vector<AttributeRow *> rows;
+    for (auto &iter : attributes) {
+        rows.push_back(&iter.getRow());
+    }
+
+    if (!m_choice) {
+        // Without choice every root is an independent breadth-first search: run them in parallel.
+        const unsigned int nthreads = depthmapX::threadsFor(rows.size());
+        std::vector<SearchState> states;
+        states.reserve(nthreads);
+        for (unsigned int t = 0; t < nthreads; t++) {
+            states.emplace_back(map.getShapeCount());
+        }
+        std::vector<depthmapX::PendingValues> results(rows.size());
+        depthmapX::runAnalysisInParallel(comm, rows.size(), nthreads, [&](size_t index, unsigned int thread) {
+            analyseRoot(index, states[thread], results[index]);
+        });
+        for (size_t index = 0; index < rows.size(); index++) {
+            for (const auto &value : results[index]) {
+                rows[index]->setValue(value.first, value.second);
+            }
+        }
+    } else {
+        // Choice picks paths with the shared random number generator and accumulates into a shared
+        // audit trail, so it stays sequential to give exactly the same results as before.
+        SearchState state(map.getShapeCount());
+        depthmapX::PendingValues values;
+        for (size_t i = 0; i < rows.size(); i++) {
+            values.clear();
+            analyseRoot(i, state, values);
+            for (const auto &value : values) {
+                rows[i]->setValue(value.first, value.second);
+            }
+            if (comm) {
+                if (qtimer(atime, 500)) {
+                    if (comm->IsCancelled()) {
+                        for (size_t k = 0; k < map.getShapeCount(); k++) {
+                            delete[] audittrail[k];
+                        }
+                        delete[] audittrail;
+                        throw Communicator::CancelledException();
+                    }
+                    comm->CommPostMessage(Communicator::CURRENT_RECORD, i);
                 }
-                comm->CommPostMessage(Communicator::CURRENT_RECORD, i);
             }
         }
     }
-    delete[] covered;
+    size_t i;
     if (m_choice) {
         i = -1;
         for (auto & iter: attributes) {

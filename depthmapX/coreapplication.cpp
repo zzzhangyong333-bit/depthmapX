@@ -14,10 +14,13 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include "depthmapX/coreapplication.h"
+#include "depthmapX/apptheme.h"
 #include <QDesktopWidget>
 
 int CoreApplication::exec() {
     SettingsImpl settings(new DefaultSettingsFactory);
+
+    AppTheme::apply(settings.readSetting(AppTheme::settingTag, AppTheme::light).toString());
 
     if (!settings.readSetting(SettingTag::licenseAccepted, false).toBool())
     {

@@ -76,6 +76,40 @@ static unsigned int g_purpleorange[] = {
    0x00B35806  // 6 orange
 };
 
+// Perceptually uniform scales (from matplotlib, CC0): 11 evenly spaced stops, interpolated linearly.
+// Unlike the banded scales above these are continuous, read correctly in greyscale print and are
+// safe for the common forms of colour blindness.
+static unsigned int g_viridis[] = {
+   0x00440154, 0x00482475, 0x00414487, 0x00355F8D, 0x002A788E, 0x0021918C,
+   0x0022A884, 0x0044BF70, 0x007AD151, 0x00BDDF26, 0x00FDE725
+};
+
+static unsigned int g_magma[] = {
+   0x00000004, 0x00140E36, 0x003B0F70, 0x00641A80, 0x008C2981, 0x00B73779,
+   0x00DE4968, 0x00F7705C, 0x00FE9F6D, 0x00FECF92, 0x00FCFDBF
+};
+
+static unsigned int interpolateStops(const unsigned int *stops, int count, double field)
+{
+   double pos = field * (count - 1);
+   int lower = int(pos);
+   if (lower >= count - 1) {
+      return stops[count - 1];
+   }
+   if (lower < 0) {
+      return stops[0];
+   }
+   double t = pos - lower;
+   unsigned int a = stops[lower], b = stops[lower + 1];
+   unsigned int result = 0;
+   for (int shift = 0; shift <= 16; shift += 8) {
+      double ca = (a >> shift) & 0xFF, cb = (b >> shift) & 0xFF;
+      unsigned int c = (unsigned int)(ca + (cb - ca) * t + 0.5);
+      result |= (c & 0xFF) << shift;
+   }
+   return result;
+}
+
 // htmlByte converts a normalised number to an HTML safe byte
 
 unsigned char htmlByte(double colorByte)
@@ -138,6 +172,12 @@ PafColor& PafColor::makeColor(double field, DisplayParams dp)
       case DisplayParams::BLUERED:
          makeBlueRed(field);
          break;
+      case DisplayParams::VIRIDIS:
+         makeViridis(field);
+         break;
+      case DisplayParams::MAGMA:
+         makeMagma(field);
+         break;
       case DisplayParams::GREYSCALE:
       case DisplayParams::MONOCHROME:
          makeGreyScale(field);
@@ -174,6 +214,18 @@ PafColor& PafColor::makePurpleOrange( double field )
 PafColor& PafColor::makeBlueRed( double field )
 {
    m_color = 0xff000000 | g_bluered[int((field - 1e-9) * 7.0)];
+   return *this;
+}
+
+PafColor& PafColor::makeViridis( double field )
+{
+   m_color = 0xff000000 | interpolateStops(g_viridis, 11, field);
+   return *this;
+}
+
+PafColor& PafColor::makeMagma( double field )
+{
+   m_color = 0xff000000 | interpolateStops(g_magma, 11, field);
    return *this;
 }
 

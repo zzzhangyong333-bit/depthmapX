@@ -24,15 +24,29 @@
 
 #include "genlib/simplematrix.h"
 
+#include <utility>
+#include <vector>
+
 class VGAVisualGlobal : IVGA {
   private:
     double m_radius;
     bool m_gates_only;
 
+    // Scratch data for one search; one instance per worker thread.
+    struct SearchState {
+        depthmapX::RowMatrix<int> miscs;
+        depthmapX::RowMatrix<PixelRef> extents;
+        std::vector<PixelRef> touched; // cells written since the last reset
+        SearchState(size_t rows, size_t cols);
+        void reset();
+    };
+    void analyseSource(PointMap &map, PixelRef curs, SearchState &state, std::vector<std::pair<int, float>> &out,
+                       bool simple_version, int entropy_col, int rel_entropy_col, int integ_dv_col,
+                       int integ_pv_col, int integ_tk_col, int depth_col, int count_col);
+    void extractUnseen(Node &node, PixelRefVector &pixels, SearchState &state);
+
   public:
     std::string getAnalysisName() const override { return "Global Visibility Analysis"; }
     bool run(Communicator *comm, PointMap &map, bool simple_version) override;
-    void extractUnseen(Node &node, PixelRefVector &pixels, depthmapX::RowMatrix<int> &miscs,
-                       depthmapX::RowMatrix<PixelRef> &extents);
     VGAVisualGlobal(double radius, bool gates_only) : m_radius(radius), m_gates_only(gates_only) {}
 };

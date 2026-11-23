@@ -33,6 +33,8 @@ set(depthmapX_SRCS
 	treeWindow.h
 	coreapplication.cpp
         coreapplication.h
+        apptheme.cpp
+        apptheme.h
         mainwindowhelpers.cpp
         mainwindowmoduleregistry.cpp
         imainwindowmodulefactory.h)

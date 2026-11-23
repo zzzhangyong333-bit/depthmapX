@@ -85,3 +85,24 @@ jobs:
             echo "::error::failing suites:$failed"
             exit 1
           fi
+
+      # Every Windows build also produces a ready-to-run zip (GUI + Qt DLLs + command line
+      # tool), downloadable from the run's "Artifacts" section on GitHub.
+      - name: Package (windows)
+        if: matrix.name == 'windows'
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p staging
+          gui=$(find build/depthmapX -maxdepth 2 -name depthmapX.exe | head -1)
+          cli=$(find build/depthmapXcli -maxdepth 2 -name depthmapXcli.exe | head -1)
+          cp "$gui" "$cli" staging/
+          windeployqt --release --compiler-runtime staging/depthmapX.exe
+
+      - name: Upload (windows)
+        if: matrix.name == 'windows'
+        uses: actions/upload-artifact@v5
+        with:
+          name: depthmapX-windows-x64
+          path: staging/*
+          if-no-files-found: error
